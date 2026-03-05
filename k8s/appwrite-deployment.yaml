@@ -1,0 +1,387 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: appwrite-staging
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: appwrite-production
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: appwrite-config
+  namespace: appwrite-production
+data:
+  APP_EDITION: "community"
+  APP_ENV: "production"
+  STORAGE_DEVICE: "s3"
+  LOGGING_CONFIG: ""
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: appwrite-secrets
+  namespace: appwrite-production
+type: Opaque
+stringData:
+  DB_PASS: "changeme"
+  DB_ROOT_PASS: "changeme"
+  OPENSSL_KEY_V1: "changeme"
+  EXECUTOR_SECRET: "changeme"
+  SMTP_PASSWORD: "changeme"
+  S3_ACCESS_KEY: "changeme"
+  S3_SECRET: "changeme"
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: appwrite-uploads-pvc
+  namespace: appwrite-production
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: fast-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: appwrite-cache-pvc
+  namespace: appwrite-production
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: fast-ssd
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mariadb
+  namespace: appwrite-production
+spec:
+  serviceName: mariadb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mariadb
+  template:
+    metadata:
+      labels:
+        app: mariadb
+    spec:
+      containers:
+      - name: mariadb
+        image: mariadb:10.11
+        ports:
+        - containerPort: 3306
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: appwrite-secrets
+              key: DB_ROOT_PASS
+        - name: MYSQL_DATABASE
+          value: "appwrite"
+        - name: MYSQL_USER
+          value: "appwrite"
+        - name: MYSQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: appwrite-secrets
+              key: DB_PASS
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2"
+        volumeMounts:
+        - name: mariadb-data
+          mountPath: /var/lib/mysql
+        healthCheck:
+          exec:
+            command:
+            - mysqladmin
+            - ping
+            - -h
+            - localhost
+          initialDelaySeconds: 30
+          periodSeconds: 10
+  volumeClaimTemplates:
+  - metadata:
+      name: mariadb-data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: fast-ssd
+      resources:
+        requests:
+          storage: 50Gi
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: appwrite-production
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.2.4-alpine
+        command:
+          - redis-server
+          - "--maxmemory=2gb"
+          - "--maxmemory-policy=allkeys-lru"
+          - "--appendonly=yes"
+          - "--appendfsync=everysec"
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1"
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 10
+          periodSeconds: 10
+  volumeClaimTemplates:
+  - metadata:
+      name: redis-data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: fast-ssd
+      resources:
+        requests:
+          storage: 20Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mariadb
+  namespace: appwrite-production
+spec:
+  clusterIP: None
+  selector:
+    app: mariadb
+  ports:
+  - port: 3306
+    targetPort: 3306
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: appwrite-production
+spec:
+  clusterIP: None
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: appwrite
+  namespace: appwrite-production
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: appwrite
+  template:
+    metadata:
+      labels:
+        app: appwrite
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - appwrite
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: appwrite
+        image: docker.io/appwrite/appwrite:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 80
+          name: http
+        env:
+        - name: _APP_ENV
+          value: "production"
+        - name: _APP_DOMAIN
+          valueFrom:
+            configMapKeyRef:
+              name: appwrite-config
+              key: APP_DOMAIN
+        - name: _APP_DB_HOST
+          value: "mariadb"
+        - name: _APP_DB_PORT
+          value: "3306"
+        - name: _APP_DB_SCHEMA
+          value: "appwrite"
+        - name: _APP_DB_USER
+          value: "appwrite"
+        - name: _APP_DB_PASS
+          valueFrom:
+            secretKeyRef:
+              name: appwrite-secrets
+              key: DB_PASS
+        - name: _APP_REDIS_HOST
+          value: "redis"
+        - name: _APP_REDIS_PORT
+          value: "6379"
+        - name: _APP_OPENSSL_KEY_V1
+          valueFrom:
+            secretKeyRef:
+              name: appwrite-secrets
+              key: OPENSSL_KEY_V1
+        - name: _APP_EXECUTOR_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: appwrite-secrets
+              key: EXECUTOR_SECRET
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 40
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        volumeMounts:
+        - name: appwrite-uploads
+          mountPath: /storage/uploads
+        - name: appwrite-cache
+          mountPath: /storage/cache
+      volumes:
+      - name: appwrite-uploads
+        persistentVolumeClaim:
+          claimName: appwrite-uploads-pvc
+      - name: appwrite-cache
+        persistentVolumeClaim:
+          claimName: appwrite-cache-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: appwrite
+  namespace: appwrite-production
+  labels:
+    app: appwrite
+spec:
+  type: LoadBalancer
+  selector:
+    app: appwrite
+  ports:
+  - port: 80
+    targetPort: 80
+    protocol: TCP
+    name: http
+  - port: 443
+    targetPort: 443
+    protocol: TCP
+    name: https
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: appwrite-hpa
+  namespace: appwrite-production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: appwrite
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: appwrite-pdb
+  namespace: appwrite-production
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: appwrite

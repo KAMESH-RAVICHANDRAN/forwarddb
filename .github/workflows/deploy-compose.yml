@@ -1,0 +1,70 @@
+name: Deploy with Docker Compose
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKER_HUB_USERNAME }}/appwrite
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get image tag
+        id: image
+        run: |
+          if [[ "${{ github.ref }}" == "refs/tags/"* ]]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="latest"
+          fi
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Deploy via SSH
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H $DEPLOY_HOST >> ~/.ssh/known_hosts 2>/dev/null
+          
+          ssh -i ~/.ssh/deploy_key $DEPLOY_USER@$DEPLOY_HOST << 'EOF'
+            cd /opt/appwrite
+            
+            # Pull latest compose file
+            git pull origin main
+            
+            # Update environment if needed
+            docker compose pull
+            
+            # Stop current services
+            docker compose down
+            
+            # Start new services with updated image
+            docker compose up -d
+            
+            # Wait for health check
+            sleep 10
+            docker compose ps
+            
+            # Verify health
+            curl -f http://localhost/health || exit 1
+            echo "Deployment successful"
+          EOF
+          
+          rm ~/.ssh/deploy_key

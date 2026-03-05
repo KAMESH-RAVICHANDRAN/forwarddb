@@ -1,0 +1,15 @@
+http:
+  middlewares:
+    https-redirect:
+      redirectScheme:
+        scheme: https
+        permanent: true
+  routers:
+    http-catchall:
+      entryPoints:
+        - appwrite_web
+      rule: "PathPrefix(`/`) && !PathPrefix(`/.well-known/`)"
+      priority: 999
+      middlewares:
+        - https-redirect
+      service: appwrite_api@docker

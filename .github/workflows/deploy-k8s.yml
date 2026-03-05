@@ -1,0 +1,91 @@
+name: Deploy to Kubernetes
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKER_HUB_USERNAME }}/appwrite
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine environment
+        id: env
+        run: |
+          if [[ "${{ github.ref }}" == "refs/tags/v"* ]]; then
+            echo "target=production" >> $GITHUB_OUTPUT
+          else
+            echo "target=staging" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.27.0'
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Get image tag
+        id: image
+        run: |
+          if [[ "${{ github.ref }}" == "refs/tags/"* ]]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="latest"
+          fi
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Deploy to ${{ steps.env.outputs.target }}
+        run: |
+          kubectl set image deployment/appwrite \
+            appwrite=${{ env.IMAGE_NAME }}:${{ steps.image.outputs.tag }} \
+            -n appwrite-${{ steps.env.outputs.target }}
+          kubectl rollout status deployment/appwrite \
+            -n appwrite-${{ steps.env.outputs.target }} \
+            --timeout=5m
+
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n appwrite-${{ steps.env.outputs.target }}
+          kubectl get svc -n appwrite-${{ steps.env.outputs.target }}
+
+      - name: Check health
+        run: |
+          ENDPOINT=$(kubectl get svc appwrite -n appwrite-${{ steps.env.outputs.target }} \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          
+          for i in {1..30}; do
+            if curl -f http://$ENDPOINT/health || true; then
+              echo "Health check passed"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Health check failed"
+          exit 1
